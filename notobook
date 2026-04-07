@@ -1,0 +1,575 @@
+# This Python 3 environment comes with many helpful analytics libraries installed
+# It is defined by the kaggle/python Docker image: https://github.com/kaggle/docker-python
+# For example, here's several helpful packages to load
+
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
+
+# Input data files are available in the read-only "../input/" directory
+# For example, running this (by clicking run or pressing Shift+Enter) will list all files under the input directory
+
+import os
+for dirname, _, filenames in os.walk('/kaggle/input'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+
+# You can write up to 20GB to the current directory (/kaggle/working/) that gets preserved as output when you create a version using "Save & Run All" 
+# You can also write temporary files to /kaggle/temp/, but they won't be saved outside of the current session
+
+
+# Notebook の変数を完全リセット
+get_ipython().run_line_magic("reset", " -f")
+
+
+#ライブラリの読み込み
+import numpy as np
+import pandas as pd
+import os
+import pickle
+import gc 
+
+# 分布確認
+# import pandas_profiling as pdp
+import ydata_profiling as pdp # ライブラリ名称が変更になったため
+
+# 可視化
+import matplotlib.pyplot as plt
+
+# 前処理
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, LabelEncoder, OneHotEncoder
+
+# バリデーション
+from sklearn.model_selection import train_test_split, KFold, StratifiedKFold
+
+# 評価指標
+from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix
+
+# モデリング: lightgbm
+import lightgbm as lgb
+
+import warnings
+warnings.filterwarnings("ignore")
+
+# matplotilbで日本語表示したい場合はこれをinstallしてインポートする
+get_ipython().getoutput("pip install japanize-matplotlib")
+import japanize_matplotlib
+get_ipython().run_line_magic("matplotlib", " inline")
+
+
+#ファイルの読み込み
+df_train = pd.read_csv("/kaggle/input/competitions/titanic/train.csv")
+df_train.head()
+
+
+df_test = pd.read_csv("/kaggle/input/competitions/titanic/test.csv")
+df_test.head()
+
+
+#レコード数とカラム数の確認
+print(df_train.shape)
+
+print(df_test.shape)
+
+
+#データの確認
+df_train.info()
+
+
+df_test.info()
+
+
+#欠損値の確認
+df_train.isnull().sum()
+
+
+df_test.isnull().sum()
+
+
+median_age = df_train["Age"].median()
+
+df_train["Age"] = df_train["Age"].fillna(median_age)
+df_test["Age"]  = df_test["Age"].fillna(median_age)
+
+
+median_fare = df_train["Fare"].median()
+
+df_train["Fare"] = df_train["Fare"].fillna(median_fare)
+df_test["Fare"]  = df_test["Fare"].fillna(median_fare)
+
+
+mode_embarked = df_train["Embarked"].mode()[0]
+
+df_train["Embarked"] = df_train["Embarked"].fillna(mode_embarked)
+df_test["Embarked"]  = df_test["Embarked"].fillna(mode_embarked)
+
+
+df_train_raw = df_train.copy()
+df_test_raw = df_test.copy()
+
+
+df_train = df_train.drop(columns=["Cabin"])
+df_test  = df_test.drop(columns=["Cabin"])
+
+
+df_train = df_train.drop(columns=["Name", "Ticket"])
+df_test  = df_test.drop(columns=["Name", "Ticket"])
+
+
+x_train = df_train.drop(columns=["Survived", "PassengerId"])
+y_train = df_train["Survived"]
+id_train = df_train["PassengerId"]
+
+
+x_test = df_test.drop(columns=["PassengerId"])
+id_test = df_test["PassengerId"]
+
+
+for col in ["Sex", "Embarked"]:
+    x_train[col] = x_train[col].astype("category")
+    x_test[col]  = x_test[col].astype("category")
+
+
+print(x_train.shape, y_train.shape, id_train.shape)
+
+
+#モデル学習、評価の関数化
+
+params = {
+    'boosting_type': 'gbdt',
+    'objective': 'binary', 
+    'metric': 'auc',
+    'learning_rate': 0.1,
+    'num_leaves': 16,
+    'n_estimators': 5000,
+    "random_state": 123,
+    "importance_type": "gain",
+}    
+
+def train_cv(input_x, input_y, params, n_splits=5, run_name="run0"):
+
+    # --- run ごとの保存フォルダ ---
+    save_dir = f"{BASE_DIR}/{run_name}"
+    os.makedirs(save_dir, exist_ok=True)
+    
+
+    metrics = []
+    imp = pd.DataFrame()
+    oof = np.zeros(len(input_x))
+
+    cv = list(StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=123).split(input_x, input_y))
+
+    for nfold in range(n_splits):
+        idx_tr, idx_va = cv[nfold]
+        x_tr, y_tr = input_x.iloc[idx_tr, :], input_y.iloc[idx_tr]
+        x_va, y_va = input_x.iloc[idx_va, :], input_y.iloc[idx_va]
+
+        model = lgb.LGBMClassifier(**params)
+
+        model.fit(
+            x_tr, y_tr,
+            eval_set=[(x_tr, y_tr), (x_va, y_va)],
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=100, verbose=False),
+            ],
+        )
+
+        # --- run ごとにモデル保存 ---
+        model.booster_.save_model(f"{save_dir}/model_fold{nfold}.txt")
+
+        # AUC 用の確率予測
+        y_tr_pred = model.predict_proba(x_tr)[:, 1]
+        y_va_pred = model.predict_proba(x_va)[:, 1]
+
+        auc_tr = roc_auc_score(y_tr, y_tr_pred)
+        auc_va = roc_auc_score(y_va, y_va_pred)
+
+        metrics.append([nfold, auc_tr, auc_va])
+
+        oof[idx_va] = y_va_pred
+
+        _imp = pd.DataFrame({
+            "col": input_x.columns,
+            "imp": model.feature_importances_,
+            "nfold": nfold
+        })
+        imp = pd.concat([imp, _imp], axis=0, ignore_index=True)
+
+    metrics = np.array(metrics)
+
+    cv_tr_mean = metrics[:,1].mean()
+    cv_tr_std  = metrics[:,1].std()
+    cv_va_mean = metrics[:,2].mean()
+    cv_va_std  = metrics[:,2].std()
+
+    oof_auc = roc_auc_score(input_y, oof)
+
+    print("-"*20, f"result ({run_name})", "-"*20)
+    print("[cv ] tr: {:.4f}+-{:.4f}, va: {:.4f}+-{:.4f}".format(
+        cv_tr_mean, cv_tr_std,
+        cv_va_mean, cv_va_std,
+    ))
+    print("[oof] {:.4f}".format(oof_auc))
+
+    imp = imp.groupby("col")["imp"].agg(["mean", "std"]).reset_index()
+    imp.columns = ["col", "imp", "imp_std"]
+
+    log_text = (
+        f"run: {run_name}\n"
+        f"CV AUC_tr: {cv_tr_mean:.5f} ± {cv_tr_std:.5f}\n"
+        f"CV AUC_va: {cv_va_mean:.5f} ± {cv_va_std:.5f}\n"
+        f"OOF AUC: {oof_auc:.5f}"
+    )
+
+    # --- log_text も run ごとに保存 ---
+    with open(f"{save_dir}/history.txt", "w") as f:
+        f.write(log_text)
+
+    return imp, metrics, oof, log_text
+
+
+import os
+import re
+
+BASE_DIR = "/kaggle/working/runs"
+
+def get_next_run_name(base_dir=BASE_DIR):
+    os.makedirs(base_dir, exist_ok=True)
+
+    runs = [d for d in os.listdir(base_dir) if re.match(r"run\d+", d)]
+
+    if not runs:
+        return "run0"
+
+    nums = [int(re.search(r"run(\d+)", r).group(1)) for r in runs]
+    next_id = max(nums) + 1
+
+    return f"run{next_id}"
+
+
+
+import re
+import glob
+
+def parse_log(text):
+    tr = float(re.search(r"CV AUC_tr: ([0-9.]+)", text).group(1))
+    va = float(re.search(r"CV AUC_va: ([0-9.]+)", text).group(1))
+    oof = float(re.search(r"OOF AUC: ([0-9.]+)", text).group(1))
+    return tr, va, oof
+
+results = []
+
+for path in sorted(glob.glob("/kaggle/working/runs/run*//history.txt")):
+    text = open(path).read()
+    tr, va, oof = parse_log(text)
+    results.append([path, tr, va, oof])
+
+pd.DataFrame(results, columns=["run", "AUC_tr", "AUC_va", "AUC_oof"])
+
+
+run_name = get_next_run_name()
+imp, metrics, oof, log_text = train_cv(x_train, y_train, params, run_name=run_name)
+
+
+#特徴量を追加
+df_train["FamilySize"] = df_train["SibSp"] + df_train["Parch"] + 1
+df_test["FamilySize"] = df_test["SibSp"] + df_test["Parch"] + 1
+
+df_train["IsAlone"] = (df_train["FamilySize"] == 1).astype(int)
+df_test["IsAlone"] = (df_test["FamilySize"] == 1).astype(int)
+
+
+#データセットを作成
+x_train = df_train.drop(columns=["Survived", "PassengerId"])
+y_train = df_train["Survived"]
+id_train = df_train["PassengerId"]
+
+x_test = df_test.drop(columns=["PassengerId"])
+id_test = df_test["PassengerId"]
+
+for col in ["Sex", "Embarked"]:
+    x_train[col] = x_train[col].astype("category")
+    x_test[col]  = x_test[col].astype("category")
+
+print(x_train.shape, y_train.shape, id_train.shape)
+
+
+run_name = get_next_run_name()
+imp, metrics, oof, log_text = train_cv(x_train, y_train, params, run_name=run_name)
+
+
+imp.sort_values("imp", ascending=False, ignore_index=True)
+
+
+df_train.drop(columns=["IsAlone"], inplace=True)
+df_test.drop(columns=["IsAlone"], inplace=True)
+
+
+#データセットを作成
+x_train = df_train.drop(columns=["Survived", "PassengerId"])
+y_train = df_train["Survived"]
+id_train = df_train["PassengerId"]
+
+x_test = df_test.drop(columns=["PassengerId"])
+id_test = df_test["PassengerId"]
+
+for col in ["Sex", "Embarked"]:
+    x_train[col] = x_train[col].astype("category")
+    x_test[col]  = x_test[col].astype("category")
+
+print(x_train.shape, y_train.shape, id_train.shape)
+
+
+run_name = get_next_run_name()
+imp, metrics, oof, log_text = train_cv(x_train, y_train, params, run_name=run_name)
+
+
+imp.sort_values("imp", ascending=False, ignore_index=True)
+
+
+df_train["TicketGroup"] = df_train_raw.groupby("Ticket")["Ticket"].transform("count")
+df_test["TicketGroup"] = df_test_raw.groupby("Ticket")["Ticket"].transform("count")
+
+
+#データセットを作成
+x_train = df_train.drop(columns=["Survived", "PassengerId"])
+y_train = df_train["Survived"]
+id_train = df_train["PassengerId"]
+
+x_test = df_test.drop(columns=["PassengerId"])
+id_test = df_test["PassengerId"]
+
+for col in ["Sex", "Embarked"]:
+    x_train[col] = x_train[col].astype("category")
+    x_test[col]  = x_test[col].astype("category")
+
+print(x_train.shape, y_train.shape, id_train.shape)
+
+
+run_name = get_next_run_name()
+imp, metrics, oof, log_text = train_cv(x_train, y_train, params, run_name=run_name)
+
+
+imp.sort_values("imp", ascending=False, ignore_index=True)
+
+
+df_train["Deck"] = df_train_raw["Cabin"].str[0].fillna("U").astype("category")
+df_test["Deck"] = df_test_raw["Cabin"].str[0].fillna("U").astype("category")
+
+
+#データセットを作成
+x_train = df_train.drop(columns=["Survived", "PassengerId"])
+y_train = df_train["Survived"]
+id_train = df_train["PassengerId"]
+
+x_test = df_test.drop(columns=["PassengerId"])
+id_test = df_test["PassengerId"]
+
+for col in ["Sex", "Embarked"]:
+    x_train[col] = x_train[col].astype("category")
+    x_test[col]  = x_test[col].astype("category")
+
+print(x_train.shape, y_train.shape, id_train.shape)
+
+
+run_name = get_next_run_name()
+imp, metrics, oof, log_text = train_cv(x_train, y_train, params, run_name=run_name)
+
+
+imp.sort_values("imp", ascending=False, ignore_index=True)
+
+
+def extract_title(df):
+    df["Title"] = df["Name"].str.extract(r",\s*([^\.]+)\.")
+    
+    # 主要4種類にまとめる（最小構造）
+    df["Title"] = df["Title"].replace({
+        "Mlle": "Miss",
+        "Ms": "Miss",
+        "Mme": "Mrs",
+    })
+
+    df["Title"] = df["Title"].apply(lambda x: x if x in ["Mr", "Mrs", "Miss", "Master"] else "Other")
+    return df
+
+
+df_train["Title"] = extract_title(df_train_raw)["Title"]
+df_test["Title"]  = extract_title(df_test_raw)["Title"]
+
+
+#データセットを作成
+x_train = df_train.drop(columns=["Survived", "PassengerId"])
+y_train = df_train["Survived"]
+id_train = df_train["PassengerId"]
+
+x_test = df_test.drop(columns=["PassengerId"])
+id_test = df_test["PassengerId"]
+
+for col in ["Sex", "Embarked", "Title"]:
+    x_train[col] = x_train[col].astype("category")
+    x_test[col]  = x_test[col].astype("category")
+
+print(x_train.shape, y_train.shape, id_train.shape)
+
+
+run_name = get_next_run_name()
+imp, metrics, oof, log_text = train_cv(x_train, y_train, params, run_name=run_name)
+
+
+imp.sort_values("imp", ascending=False, ignore_index=True)
+
+
+def extract_title(df):
+    df = df.copy()
+    df["Title"] = df["Name"].str.extract(r",\s*([^\.]+)\.")
+
+    df["Title"] = df["Title"].replace({
+        "Mlle": "Miss",
+        "Ms": "Miss",
+        "Mme": "Mrs",
+    })
+
+    officer = ["Col", "Major", "Capt"]
+    royalty = ["Lady", "Sir", "Countess"]
+
+    df["Title"] = df["Title"].apply(
+        lambda x:
+            "Officer" if x in officer else
+            "Royalty" if x in royalty else
+            x if x in ["Mr", "Mrs", "Miss", "Master"] else
+            "Other"
+    )
+    return df
+
+
+df_train["Title"] = extract_title(df_train_raw)["Title"]
+df_test["Title"]  = extract_title(df_test_raw)["Title"]
+
+
+#データセットを作成
+x_train = df_train.drop(columns=["Survived", "PassengerId"])
+y_train = df_train["Survived"]
+id_train = df_train["PassengerId"]
+
+x_test = df_test.drop(columns=["PassengerId"])
+id_test = df_test["PassengerId"]
+
+for col in ["Sex", "Embarked", "Title"]:
+    x_train[col] = x_train[col].astype("category")
+    x_test[col]  = x_test[col].astype("category")
+
+print(x_train.shape, y_train.shape, id_train.shape)
+
+
+run_name = get_next_run_name()
+imp, metrics, oof, log_text = train_cv(x_train, y_train, params, run_name=run_name)
+
+
+imp.sort_values("imp", ascending=False, ignore_index=True)
+
+
+def extract_title(df):
+    df = df.copy()
+    df["Title"] = df["Name"].str.extract(r",\s*([^\.]+)\.")
+
+    df["Title"] = df["Title"].replace({
+        "Mlle": "Miss",
+        "Ms": "Miss",
+        "Mme": "Mrs",
+    })
+
+    officer = ["Col", "Major", "Capt"]
+    royalty = ["Lady", "Sir", "Countess"]
+
+    df["Title"] = df["Title"].apply(
+        lambda x:
+            "Officer" if x in officer else
+            "Royalty" if x in royalty else
+            "Dr" if x == "Dr" else
+            "Rev" if x == "Rev" else
+            x if x in ["Mr", "Mrs", "Miss", "Master"] else
+            "Common"
+    )
+    return df
+
+
+df_train["Title"] = extract_title(df_train_raw)["Title"]
+df_test["Title"]  = extract_title(df_test_raw)["Title"]
+
+
+#データセットを作成
+x_train = df_train.drop(columns=["Survived", "PassengerId"])
+y_train = df_train["Survived"]
+id_train = df_train["PassengerId"]
+
+x_test = df_test.drop(columns=["PassengerId"])
+id_test = df_test["PassengerId"]
+
+for col in ["Sex", "Embarked", "Title"]:
+    x_train[col] = x_train[col].astype("category")
+    x_test[col]  = x_test[col].astype("category")
+
+print(x_train.shape, y_train.shape, id_train.shape)
+
+
+run_name = get_next_run_name()
+imp, metrics, oof, log_text = train_cv(x_train, y_train, params, run_name=run_name)
+
+
+imp.sort_values("imp", ascending=False, ignore_index=True)
+
+
+pd.DataFrame(results, columns=["run", "AUC_tr", "AUC_va", "AUC_oof"])
+
+
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+
+def predict_lgb(input_x,
+                input_id,
+                run_name,
+                list_nfold=[0,1,2,3,4]):
+    
+    model_dir = f"/kaggle/working/runs/{run_name}"
+    
+    pred = np.zeros((len(input_x), len(list_nfold)))
+    
+    for nfold in list_nfold:
+        print("-"*20, f"fold {nfold}", "-"*20)
+        
+        # ★ LightGBM のテキストモデルを読み込む
+        fname_lgb = f"{model_dir}/model_fold{nfold}.txt"
+        model = lgb.Booster(model_file=fname_lgb)
+        
+        # LightGBM Booster の predict
+        pred[:, nfold] = model.predict(input_x)
+    
+    pred_mean = pred.mean(axis=1)
+    
+    pred_df = pd.concat([
+        input_id.reset_index(drop=True),
+        pd.DataFrame({"pred": pred_mean})
+    ], axis=1)
+    
+    print("Done.")
+    return pred_df
+
+
+pred_df = predict_lgb(
+    input_x=x_test,
+    input_id=id_test,
+    run_name="run7"
+)
+
+
+submission = pred_df.copy()
+submission["Survived"] = (submission["pred"] > 0.5).astype(int)
+submission = submission[["PassengerId", "Survived"]]
+submission.to_csv("submission.csv", index=False)
+
+
+print(submission.shape)
+display(submission.head())
+
+
+
