@@ -1,2 +1,2 @@
-kaggle titanic　COMPETITIONS　notobook
+kaggle titanic competitions notobook
 
